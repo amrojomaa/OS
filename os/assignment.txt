@@ -1,0 +1,200 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include <time.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <pthread.h>
+
+// Define N and M based on your student ID
+#define N 216951
+#define M 4
+
+// Global arrays
+double *packet1, *packet2, *result_packet1, *result_packet2, *result_packet3;
+
+// Function to initialize arrays
+void initialize_arrays() {
+    packet1 = malloc(N * sizeof(double));
+    packet2 = malloc(N * sizeof(double));
+    result_packet1 = malloc(N * sizeof(double));
+    result_packet2 = malloc(N * sizeof(double));
+    result_packet3 = malloc(N * sizeof(double));
+
+    srand(time(NULL));
+    for (int i = 0; i < N; i++) {
+        packet1[i] = (double)rand() / (double)(RAND_MAX / N);
+        packet2[i] = 1.0 + (double)rand() / (double)(RAND_MAX / 9);
+    }
+}
+
+// Part 1: Serial Computation
+double serial_computation() {
+    clock_t start = clock();
+    for (int i = 0; i < N; i++) {
+        result_packet1[i] = pow(packet1[i], packet2[i]);
+    }
+    clock_t end = clock();
+    return ((double)(end - start)) / CLOCKS_PER_SEC;
+}
+
+// Part 2: Fork with Binary Files
+double fork_file_io() {
+    clock_t start = clock();
+    pid_t pids[M];
+    int chunk = N / M;
+
+    for (int i = 0; i < M; i++) {
+        pids[i] = fork();
+        if (pids[i] == 0) { // Child process
+            int start_idx = i * chunk;
+            int end_idx = (i == M - 1) ? N : start_idx + chunk;
+            double *temp_result = malloc((end_idx - start_idx) * sizeof(double));
+
+            for (int j = start_idx; j < end_idx; j++) {
+                temp_result[j - start_idx] = pow(packet1[j], packet2[j]);
+            }
+
+            char filename[20];
+            sprintf(filename, "%d.bin", getpid());
+            FILE *fp = fopen(filename, "wb");
+            fwrite(temp_result, sizeof(double), end_idx - start_idx, fp);
+            fclose(fp);
+            free(temp_result);
+            exit(0);
+        }
+    }
+
+    // Parent waits for all children
+    for (int i = 0; i < M; i++) {
+        wait(NULL);
+    }
+
+    // Collect results
+    for (int i = 0; i < M; i++) {
+        int start_idx = i * chunk;
+        int end_idx = (i == M - 1) ? N : start_idx + chunk;
+        char filename[20];
+        sprintf(filename, "%d.bin", pids[i]);
+        FILE *fp = fopen(filename, "rb");
+        fread(&result_packet2[start_idx], sizeof(double), end_idx - start_idx, fp);
+        fclose(fp);
+        remove(filename); // Clean up
+    }
+
+    clock_t end = clock();
+    return ((double)(end - start)) / CLOCKS_PER_SEC;
+}
+
+// Part 3: Fork with Shared Memory
+double fork_shared_memory() {
+    clock_t start = clock();
+    int shm_fd = shm_open("/my_shm", O_CREAT | O_RDWR, 0666);
+    ftruncate(shm_fd, N * sizeof(double));
+    double *shared_result = mmap(0, N * sizeof(double), PROT_WRITE | PROT_READ, MAP_SHARED, shm_fd, 0);
+
+    pid_t pids[M];
+    int chunk = N / M;
+
+    for (int i = 0; i < M; i++) {
+        pids[i] = fork();
+        if (pids[i] == 0) { // Child process
+            int start_idx = i * chunk;
+            int end_idx = (i == M - 1) ? N : start_idx + chunk;
+            for (int j = start_idx; j < end_idx; j++) {
+                shared_result[j] = pow(packet1[j], packet2[j]);
+            }
+            exit(0);
+        }
+    }
+
+    // Parent waits for all children
+    for (int i = 0; i < M; i++) {
+        wait(NULL);
+    }
+
+    // Copy to result_packet2
+    for (int i = 0; i < N; i++) {
+        result_packet2[i] = shared_result[i];
+    }
+
+    munmap(shared_result, N * sizeof(double));
+    close(shm_fd);
+    shm_unlink("/my_shm");
+
+    clock_t end = clock();
+    return ((double)(end - start)) / CLOCKS_PER_SEC;
+}
+
+// Part 4: Pthreads
+typedef struct {
+    int start_idx;
+    int end_idx;
+} thread_args;
+
+void *thread_compute(void *arg) {
+    thread_args *args = (thread_args *)arg;
+    for (int i = args->start_idx; i < args->end_idx; i++) {
+        result_packet3[i] = pow(packet1[i], packet2[i]);
+    }
+    return NULL;
+}
+
+double pthread_computation() {
+    clock_t start = clock();
+    pthread_t threads[M];
+    thread_args args[M];
+    int chunk = N / M;
+
+    for (int i = 0; i < M; i++) {
+        args[i].start_idx = i * chunk;
+        args[i].end_idx = (i == M - 1) ? N : args[i].start_idx + chunk;
+        pthread_create(&threads[i], NULL, thread_compute, &args[i]);
+    }
+
+    for (int i = 0; i < M; i++) {
+        pthread_join(threads[i], NULL);
+    }
+
+    clock_t end = clock();
+    return ((double)(end - start)) / CLOCKS_PER_SEC;
+}
+
+// Verify correctness
+int verify_results() {
+    for (int i = 0; i < N; i++) {
+        if (result_packet1[i] != result_packet2[i] || result_packet1[i] != result_packet3[i]) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+int main() {
+    initialize_arrays();
+
+    double time_serial = serial_computation();
+    double time_fork_file = fork_file_io();
+    double time_fork_shm = fork_shared_memory();
+    double time_pthreads = pthread_computation();
+
+    printf("Serial Computation Time: %.6f seconds\n", time_serial);
+    printf("Fork with File IO Time: %.6f seconds\n", time_fork_file);
+    printf("Fork with Shared Memory Time: %.6f seconds\n", time_fork_shm);
+    printf("Pthreads Time: %.6f seconds\n", time_pthreads);
+
+    if (verify_results()) {
+        printf("All results are identical.\n");
+    } else {
+        printf("Results mismatch!\n");
+    }
+
+    free(packet1);
+    free(packet2);
+    free(result_packet1);
+    free(result_packet2);
+    free(result_packet3);
+    return 0;
+}
